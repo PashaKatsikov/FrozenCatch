@@ -1,0 +1,393 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
+
+import '../runtime/agent_mint.dart';
+import '../runtime/beacon_hub.dart';
+import '../runtime/icy_cache.dart';
+import '../runtime/tide_sensor.dart';
+import '../theme/app_colors.dart';
+import 'no_signal_stage.dart';
+
+// ============================================================
+// CONTENT STAGE — full-screen WebView (gray content)
+// ============================================================
+// Hosts the destination URL with:
+//   • Forged device UA (see agent_mint.dart)
+//   • Both orientations, immersive system UI
+//   • Non-http(s) scheme hand-off to the OS
+//   • Redirect-loop recovery (up to 3 retries)
+//   • Live connectivity guard (jump straight to No-Signal, no DNS
+//     probe — probing while offline can hang for seconds and lets
+//     the WebView show the native error page)
+//   • Warm push URL loading
+//   • File upload via a native chooser routed over a MethodChannel
+//   • Third-party cookies + inline autoplay + DRM auto-grant
+//   • Safe-area / keyboard JS injection
+// ============================================================
+
+class ContentStage extends StatefulWidget {
+  const ContentStage({
+    super.key,
+    required this.destination,
+    required this.cache,
+    required this.beaconHub,
+    required this.tideSensor,
+  });
+
+  final String destination;
+  final IcyCache cache;
+  final BeaconHub beaconHub;
+  final TideSensor tideSensor;
+
+  @override
+  State<ContentStage> createState() => _ContentStageState();
+}
+
+class _ContentStageState extends State<ContentStage>
+    with WidgetsBindingObserver {
+  late final WebViewController _controller;
+  bool _spinning = true;
+  bool _offlineRouted = false;
+  String? _lastMainFrameUrl;
+  int _redirectRetries = 0;
+  Timer? _offlineDebounce;
+  StreamSubscription<List<ConnectivityResult>>? _tideSub;
+
+  // MethodChannel MUST match the value used by MainActivity.kt.
+  // [FINGERPRINT] — unique per project (was `tower/upload` in the template).
+  static const MethodChannel _uploadPipe =
+      MethodChannel('frozencatch/media_bridge');
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    _enterImmersive();
+    _wireController();
+
+    widget.beaconHub.onLiveDestination = (String url) {
+      if (mounted) _controller.loadRequest(Uri.parse(url));
+    };
+
+    // Debounce a full 700 ms so VPN flicker does not route to offline.
+    _tideSub = widget.tideSensor.transitions
+        .listen((List<ConnectivityResult> r) {
+      final bool allNone = r.isNotEmpty &&
+          r.every((ConnectivityResult e) => e == ConnectivityResult.none);
+      if (!allNone) {
+        _offlineDebounce?.cancel();
+        return;
+      }
+      _offlineDebounce?.cancel();
+      _offlineDebounce = Timer(const Duration(milliseconds: 700), () {
+        _routeOfflineImmediate();
+      });
+    });
+  }
+
+  void _enterImmersive() {
+    // Full immersive hides both bars. The keyboard is handled by the JS
+    // scroll fix (visualViewport), so no window resize is needed.
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _enterImmersive();
+  }
+
+  void _wireController() {
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setUserAgent(frostHttp.userAgent)
+      ..setBackgroundColor(Colors.black)
+      ..enableZoom(false)
+      ..setNavigationDelegate(NavigationDelegate(
+        onPageStarted: (_) {
+          if (mounted) setState(() => _spinning = true);
+        },
+        onPageFinished: (_) {
+          if (mounted) setState(() => _spinning = false);
+          _redirectRetries = 0;
+          _injectSafeAreaOverride();
+          _injectKeyboardScrollFix();
+        },
+        onWebResourceError: (WebResourceError err) {
+          if (err.isForMainFrame != true) return;
+          final String desc = err.description.toLowerCase();
+          final bool redirectLoop = desc.contains('too_many_redirects') ||
+              desc.contains('too many redirects') ||
+              err.errorCode == -1007 ||
+              err.errorCode == -9;
+          if (redirectLoop &&
+              _lastMainFrameUrl != null &&
+              _redirectRetries < 3) {
+            _redirectRetries++;
+            _controller.loadRequest(Uri.parse(_lastMainFrameUrl!));
+            return;
+          }
+          // Cover the WebView with the spinner immediately so the native
+          // Android error page never shows.
+          if (mounted) setState(() => _spinning = true);
+          final bool dnsOrDrop = desc.contains('name_not_resolved') ||
+              desc.contains('err_name_not_resolved') ||
+              desc.contains('internet_disconnected') ||
+              desc.contains('network_changed') ||
+              err.errorCode == -105 ||
+              err.errorCode == -106 ||
+              err.errorCode == -21;
+          if (dnsOrDrop) {
+            _routeOfflineImmediate();
+          } else {
+            _routeOfflineIfDown();
+          }
+        },
+        onNavigationRequest: (NavigationRequest req) {
+          final Uri? uri = Uri.tryParse(req.url);
+          if (uri == null) return NavigationDecision.prevent;
+          const Set<String> inline = <String>{
+            'http',
+            'https',
+            'about',
+            'data',
+            'blob',
+          };
+          if (inline.contains(uri.scheme)) {
+            if (req.isMainFrame) _lastMainFrameUrl = req.url;
+            return NavigationDecision.navigate;
+          }
+          _openExternal(uri);
+          return NavigationDecision.prevent;
+        },
+      ));
+
+    _tunePlatform();
+    _controller.loadRequest(Uri.parse(widget.destination));
+  }
+
+  void _tunePlatform() {
+    if (!Platform.isAndroid) return;
+    if (_controller.platform is! AndroidWebViewController) return;
+    final AndroidWebViewController a =
+        _controller.platform as AndroidWebViewController;
+
+    // Inline autoplay video — TZ §"Inline autoplay video".
+    a.setMediaPlaybackRequiresUserGesture(false);
+
+    // Auto-grant DRM / MIDI etc. so partner streams play without a
+    // permission modal. Camera / mic requests only fire on explicit
+    // user opt-in inside the site, so this echoes the browser default.
+    a.setOnPlatformPermissionRequest(
+      (PlatformWebViewPermissionRequest req) => req.grant(),
+    );
+
+    // Native file chooser routed over MethodChannel — see MainActivity.kt.
+    a.setOnShowFileSelector(_pickAttachments);
+
+    // Third-party cookies for OAuth / payment provider round-trips.
+    final AndroidWebViewCookieManager cookieMan = AndroidWebViewCookieManager(
+      AndroidWebViewCookieManagerCreationParams
+          .fromPlatformWebViewCookieManagerCreationParams(
+        const PlatformWebViewCookieManagerCreationParams(),
+      ),
+    );
+    cookieMan.setAcceptThirdPartyCookies(a, true);
+  }
+
+  Future<List<String>> _pickAttachments(FileSelectorParams p) async {
+    try {
+      final List<Object?>? picked =
+          await _uploadPipe.invokeMethod<List<Object?>>('choose',
+              <String, Object>{
+        'multiple': p.mode == FileSelectorMode.openMultiple,
+        'mimeTypes': p.acceptTypes
+            .where((String t) => t.trim().isNotEmpty)
+            .toList(),
+      });
+      if (picked == null) return const <String>[];
+      return picked.whereType<String>().toList();
+    } catch (_) {
+      return const <String>[];
+    }
+  }
+
+  Future<void> _openExternal(Uri uri) async {
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {}
+  }
+
+  Future<void> _routeOfflineIfDown() async {
+    if (_offlineRouted) return;
+    final bool online = await widget.tideSensor.hasSignal();
+    if (online) return;
+    _routeOfflineImmediate();
+  }
+
+  void _routeOfflineImmediate() {
+    if (_offlineRouted || !mounted) return;
+    _offlineRouted = true;
+    final String next = _lastMainFrameUrl ?? widget.destination;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(
+        builder: (_) => NoSignalStage(
+          retryBuilder: (_) => ContentStage(
+            destination: next,
+            cache: widget.cache,
+            beaconHub: widget.beaconHub,
+            tideSensor: widget.tideSensor,
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── JS injected on every onPageFinished ─────────────────────
+
+  void _injectKeyboardScrollFix() {
+    _controller.runJavaScript(r'''
+(function(){
+  if (window.__fcKbFix) return; window.__fcKbFix = true;
+  function isField(el){return el&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable);}
+  function bring(){
+    var el=document.activeElement; if(!isField(el))return;
+    var vp=window.visualViewport;
+    if(vp){
+      var r=el.getBoundingClientRect(); var bottom=vp.offsetTop+vp.height;
+      if(r.bottom>bottom-20||r.top<vp.offsetTop){el.scrollIntoView({behavior:'auto',block:'nearest'});}
+    } else { el.scrollIntoView({behavior:'auto',block:'nearest'}); }
+  }
+  document.addEventListener('focusin',function(e){ if(isField(e.target)) setTimeout(bring,350); });
+  if(window.visualViewport){
+    var prev=window.visualViewport.height;
+    window.visualViewport.addEventListener('resize',function(){
+      var h=window.visualViewport.height; if(h<prev) setTimeout(bring,120); prev=h;
+    });
+  }
+})();
+''');
+  }
+
+  void _injectSafeAreaOverride() {
+    // Zero out custom safe-area CSS variables the partner site may
+    // declare (--sat / --sab / --safe-top / ...), and clear the top
+    // padding of well-known sticky header classes ONLY. Do NOT touch
+    // html/body/#app/#root left/right padding — that would strip the
+    // site's own gutters and squash the content. See
+    // .cursor/rules/webview_safe_area_injection.mdc.
+    _controller.runJavaScript(r'''
+(function(){
+  if(window.__fcSa) return; window.__fcSa=true;
+  var ID='__fc_sa_style';
+  var CSS=
+    ':root{'+
+    '--safe-area-inset-top:0px!important;--safe-area-inset-right:0px!important;'+
+    '--safe-area-inset-bottom:0px!important;--safe-area-inset-left:0px!important;'+
+    '--sat:0px!important;--sar:0px!important;--sab:0px!important;--sal:0px!important;'+
+    '--safe-top:0px!important;--safe-bottom:0px!important;'+
+    '--safe-left:0px!important;--safe-right:0px!important;'+
+    '}'+
+    // Only decorative sticky-header classes get their top padding zeroed.
+    '.gameview-mobile-header,.app-header,.js-safe-top{'+
+    'padding-top:0!important;margin-top:0!important;'+
+    '}';
+  function kbOpen(){
+    if(!window.visualViewport)return false;
+    return window.visualViewport.height<window.innerHeight*0.75;
+  }
+  function apply(){
+    if(kbOpen()) return;
+    var head=document.head||document.documentElement; if(!head) return;
+    var m=document.querySelector('meta[name="viewport"]');
+    if(m && !/viewport-fit\s*=\s*contain/i.test(m.getAttribute('content')||'')){
+      var c=(m.getAttribute('content')||'').replace(/,?\s*viewport-fit\s*=\s*\w+/ig,'').trim();
+      m.setAttribute('content', c+(c?', ':'')+'viewport-fit=contain');
+    }
+    var s=document.getElementById(ID);
+    if(!s){ s=document.createElement('style'); s.id=ID; head.appendChild(s); }
+    if(s.textContent!==CSS) s.textContent=CSS;
+  }
+  apply();
+  ['pushState','replaceState'].forEach(function(fn){
+    var o=history[fn];
+    history[fn]=function(){var r=o.apply(this,arguments); setTimeout(apply,80); setTimeout(apply,400); return r;};
+  });
+  window.addEventListener('popstate',function(){setTimeout(apply,80);});
+  setInterval(apply,2500);
+})();
+''');
+  }
+
+  Future<void> _back() async {
+    if (await _controller.canGoBack()) {
+      await _controller.goBack();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _offlineDebounce?.cancel();
+    _tideSub?.cancel();
+    widget.beaconHub.onLiveDestination = null;
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: SystemUiOverlay.values,
+    );
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final MediaQueryData mq = MediaQuery.of(context);
+    final bool landscape = mq.orientation == Orientation.landscape;
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (bool didPop, _) async {
+        if (!didPop) await _back();
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        resizeToAvoidBottomInset: false,
+        body: Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            // Keep a safe zone around the camera cutout in BOTH
+            // orientations (top in portrait, side in landscape). The
+            // bottom inset is not applied — the keyboard is handled
+            // by the JS scroll fix. This is the fix for
+            // gray_part_pitfalls.md §14 (landscape notch clipping).
+            SafeArea(
+              bottom: false,
+              child: WebViewWidget(controller: _controller),
+            ),
+            if (_spinning && !landscape)
+              const ColoredBox(
+                color: Color(0x80000000),
+                child: Center(
+                  child: CircularProgressIndicator(
+                    valueColor:
+                        AlwaysStoppedAnimation<Color>(AppColors.accentGold),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#7ec8e3</color>
+    <!-- Adaptive icon background — matches the icy palette so the mask
+         has no visible bleed against the launcher. -->
+    <color name="ic_launcher_background">#0B2A62</color>
+    <!-- Cold-start window background (see drawable/launch_background). -->
+    <color name="frost_launch_background">#063A63</color>
 </resources>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Network security policy. HTTPS-only by default, with a narrow
+  per-domain cleartext whitelist for AppsFlyer's redirect endpoints:
+
+    afsub.com   — AppsFlyer's short-link redirect host. Push URLs that
+                  go through OneLink land on http://afsub.com/... before
+                  the SDK swaps them for the real https:// destination.
+                  Without cleartext here, Chrome WebView aborts the whole
+                  push flow with net::ERR_CLEARTEXT_NOT_PERMITTED.
+
+  Every other host stays HTTPS-only. Do NOT blanket-allow cleartext.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">afsub.com</domain>
+        <domain includeSubdomains="true">app.appsflyer.com</domain>
+        <domain includeSubdomains="true">appsflyer.com</domain>
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

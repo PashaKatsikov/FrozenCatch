@@ -1,12 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Modify this file to customize your launch splash screen -->
+<!--
+  Solid brand colour so no white / framed launcher icon flashes on cold
+  start (see gray_part_pitfalls.md §16). Deep-ice navy matches the app's
+  scaffold background, so the transition into the loading screen is
+  seamless.
+-->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/white" />
-
-    <!-- You can insert your own image assets here -->
-    <!-- <item>
-        <bitmap
-            android:gravity="center"
-            android:src="@mipmap/launch_image" />
-    </item> -->
+    <item android:drawable="@color/frost_launch_background"/>
 </layer-list>

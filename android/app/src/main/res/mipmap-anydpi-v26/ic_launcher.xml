@@ -1,9 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive icon for Frozen Catch.
+
+  Foreground inset = 9%:  foreground image fills the inner 82% of the
+  108 dp canvas (108 - 2 * 9% * 108 = 88.6 dp).  The standard Android
+  circular mask shows ~74-80 dp, so the bucket + fish heads are safely
+  within the visible circle even on aggressive MIUI / HyperOS shapes.
+
+  Background layer = same artwork at 0% inset (fills full 108 dp bleed
+  zone), so the blue starburst background appears behind the foreground
+  on square / rounded-square launchers — no solid-colour corners visible.
+-->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-  <background android:drawable="@drawable/ic_launcher_background"/>
-  <foreground>
-      <inset
-          android:drawable="@drawable/ic_launcher_foreground"
-          android:inset="0%" />
-  </foreground>
+    <background android:drawable="@drawable/ic_launcher_background"/>
+    <foreground>
+        <inset
+            android:drawable="@drawable/ic_launcher_foreground"
+            android:inset="9%" />
+    </foreground>
 </adaptive-icon>
