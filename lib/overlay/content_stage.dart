@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show FlutterView;
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
@@ -60,6 +61,14 @@ class _ContentStageState extends State<ContentStage>
   Timer? _offlineDebounce;
   StreamSubscription<List<ConnectivityResult>>? _tideSub;
 
+  // Rotation-glitch guard. Some Android devices (HyperOS/MIUI, older Adreno
+  // GPUs) show a torn/stale frame for a few hundred ms while the WebView's
+  // hybrid-composition surface is being re-created after a rotation. We mask
+  // it with a solid opaque cover for ~350 ms, driven by didChangeMetrics.
+  Size? _lastSize;
+  bool _rotationMask = false;
+  Timer? _rotationMaskTimer;
+
   // MethodChannel MUST match the value used by MainActivity.kt.
   // [FINGERPRINT] — unique per project (was `tower/upload` in the template).
   static const MethodChannel _uploadPipe =
@@ -107,6 +116,38 @@ class _ContentStageState extends State<ContentStage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) _enterImmersive();
+  }
+
+  @override
+  void didChangeMetrics() {
+    // Fires when the display size / orientation changes. We detect a real
+    // rotation (short vs long edge swap) and drop an opaque cover on top of
+    // the WebView while its surface is being re-created — this hides the
+    // frame-tear that some Android devices show mid-rotation.
+    final FlutterView? view =
+        WidgetsBinding.instance.platformDispatcher.views.isNotEmpty
+            ? WidgetsBinding.instance.platformDispatcher.views.first
+            : null;
+    if (view == null) return;
+    final Size current = view.physicalSize;
+    final Size? previous = _lastSize;
+    _lastSize = current;
+    if (previous == null) return;
+    final bool prevLandscape = previous.width > previous.height;
+    final bool nowLandscape = current.width > current.height;
+    if (prevLandscape == nowLandscape) return;
+
+    if (!mounted) return;
+    setState(() => _rotationMask = true);
+    _rotationMaskTimer?.cancel();
+    // 350 ms covers the worst-case surface swap seen on HyperOS + Adreno 6xx.
+    // We also re-apply immersive mode after the transition — the system bars
+    // sometimes reappear after a rotation.
+    _rotationMaskTimer = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted) return;
+      _enterImmersive();
+      setState(() => _rotationMask = false);
+    });
   }
 
   void _wireController() {
@@ -341,6 +382,7 @@ class _ContentStageState extends State<ContentStage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _offlineDebounce?.cancel();
+    _rotationMaskTimer?.cancel();
     _tideSub?.cancel();
     widget.beaconHub.onLiveDestination = null;
     SystemChrome.setEnabledSystemUIMode(
@@ -384,6 +426,12 @@ class _ContentStageState extends State<ContentStage>
                         AlwaysStoppedAnimation<Color>(AppColors.accentGold),
                   ),
                 ),
+              ),
+            // Opaque cover shown briefly during a physical rotation, so the
+            // WebView's surface swap never becomes visible to the user.
+            if (_rotationMask)
+              const Positioned.fill(
+                child: ColoredBox(color: Colors.black),
               ),
           ],
         ),
