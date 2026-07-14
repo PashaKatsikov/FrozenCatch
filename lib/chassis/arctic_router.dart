@@ -13,6 +13,7 @@ import '../runtime/beacon_hub.dart';
 import '../runtime/catch_tracker.dart';
 import '../runtime/harbor_gate.dart';
 import '../runtime/icy_cache.dart';
+import '../runtime/insight.dart';
 import '../runtime/tide_sensor.dart';
 import '../screens/home_screen.dart';
 import '../theme/app_assets.dart';
@@ -70,6 +71,7 @@ class _ArcticRouterState extends State<ArcticRouter> {
   @override
   void initState() {
     super.initState();
+    Insight.screen('loading');
     _dotTicker = Timer.periodic(const Duration(milliseconds: 430), (_) {
       if (!mounted) return;
       setState(() => _dotIndex = (_dotIndex + 1) % 4);
@@ -149,6 +151,7 @@ class _ArcticRouterState extends State<ArcticRouter> {
     // Cold-start push URL wins over every other decision.
     final String? deferred = await widget.cache.consumeDeferredDestination();
     if (deferred != null) {
+      Insight.event('route_push_link');
       _liftProgress(1.0);
       await _settle();
       _routeToGray(deferred);
@@ -171,6 +174,7 @@ class _ArcticRouterState extends State<ArcticRouter> {
     if (verdict.approved && verdict.hasDestination) {
       _routeToGray(verdict.destination!);
     } else if (lastKnown != null && lastKnown.isNotEmpty) {
+      Insight.event('route_cached_link');
       _routeToGray(lastKnown);
     } else {
       _routeToOffline();
@@ -183,6 +187,17 @@ class _ArcticRouterState extends State<ArcticRouter> {
         await widget.catchTracker.composeGateBody(
       locale: locale,
       pushToken: widget.beaconHub.token,
+    );
+    // Identify the session by af_id as soon as attribution is available.
+    Insight.identify(
+      body['af_id']?.toString(),
+      tags: <String, String>{
+        'af_status': body['af_status']?.toString() ?? '',
+        'media_source': body['media_source']?.toString() ?? '',
+        'campaign': body['campaign']?.toString() ?? '',
+        'os': body['os']?.toString() ?? '',
+        'locale': body['locale']?.toString() ?? '',
+      },
     );
     return widget.harborGate.query(body);
   }
@@ -204,6 +219,8 @@ class _ArcticRouterState extends State<ArcticRouter> {
   // ── Route helpers ──────────────────────────────────────────
 
   Future<void> _routeToGame({required double initialLift}) async {
+    Insight.tag('run_mode', 'native');
+    Insight.event('route_native');
     _liftProgress(initialLift);
     // The native game is portrait-only.
     await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
@@ -253,6 +270,8 @@ class _ArcticRouterState extends State<ArcticRouter> {
   void _routeToGray(String destination) {
     if (_routed || !mounted) return;
     _routed = true;
+    Insight.tag('run_mode', 'web');
+    Insight.event('route_web');
     final bool needsBeaconPrompt =
         widget.cache.shouldShowBeaconPrompt();
     if (needsBeaconPrompt) {
@@ -267,6 +286,16 @@ class _ArcticRouterState extends State<ArcticRouter> {
         ),
       );
     } else {
+      // Returning user skips the invite — tag their permission state now
+      // so the dashboard never sees a blank notif_permission for this branch.
+      Insight.tag(
+        'notif_permission',
+        widget.cache.isBeaconAllowed()
+            ? 'granted'
+            : widget.cache.isBeaconOsBlocked()
+                ? 'os_denied'
+                : 'snoozed',
+      );
       Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(
           builder: (_) => ContentStage(
@@ -283,6 +312,7 @@ class _ArcticRouterState extends State<ArcticRouter> {
   void _routeToOffline() {
     if (_routed || !mounted) return;
     _routed = true;
+    Insight.event('route_offline');
     Navigator.of(context).pushReplacement(
       MaterialPageRoute<void>(
         builder: (_) => NoSignalStage(

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../runtime/beacon_hub.dart';
 import '../runtime/icy_cache.dart';
+import '../runtime/insight.dart';
 import '../runtime/tide_sensor.dart';
 import '../settings/identity.dart';
 import '../theme/app_assets.dart';
@@ -25,7 +26,7 @@ import 'frost_action_button.dart';
 //     button styles so neither looks like an afterthought.
 // ============================================================
 
-class BeaconPromptStage extends StatelessWidget {
+class BeaconPromptStage extends StatefulWidget {
   const BeaconPromptStage({
     super.key,
     required this.cache,
@@ -39,16 +40,32 @@ class BeaconPromptStage extends StatelessWidget {
   final TideSensor tideSensor;
   final String grayDestination;
 
+  @override
+  State<BeaconPromptStage> createState() => _BeaconPromptStageState();
+}
+
+class _BeaconPromptStageState extends State<BeaconPromptStage> {
+  @override
+  void initState() {
+    super.initState();
+    Insight.screen('push_invite');
+  }
+
   Future<void> _accept(BuildContext context) async {
-    final bool granted = await beaconHub.requestPermission();
+    Insight.event('push_invite_accept');
+    final bool granted = await widget.beaconHub.requestPermission();
+    Insight.tag('notif_permission', granted ? 'granted' : 'denied');
+    Insight.event(granted ? 'push_granted' : 'push_denied');
     if (!granted) {
-      await cache.writePromptCooldown(_cooldownStamp());
+      await widget.cache.writePromptCooldown(_cooldownStamp());
     }
     if (context.mounted) _proceed(context);
   }
 
   Future<void> _skip(BuildContext context) async {
-    await cache.writePromptCooldown(_cooldownStamp());
+    Insight.event('push_invite_skip');
+    Insight.tag('notif_permission', 'skipped');
+    await widget.cache.writePromptCooldown(_cooldownStamp());
     if (context.mounted) _proceed(context);
   }
 
@@ -60,10 +77,10 @@ class BeaconPromptStage extends StatelessWidget {
     Navigator.of(context).pushReplacement(
       MaterialPageRoute<void>(
         builder: (_) => ContentStage(
-          destination: grayDestination,
-          cache: cache,
-          beaconHub: beaconHub,
-          tideSensor: tideSensor,
+          destination: widget.grayDestination,
+          cache: widget.cache,
+          beaconHub: widget.beaconHub,
+          tideSensor: widget.tideSensor,
         ),
       ),
     );

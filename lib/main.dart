@@ -1,3 +1,4 @@
+import 'package:clarity_flutter/clarity_flutter.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
@@ -10,6 +11,7 @@ import 'runtime/beacon_hub.dart';
 import 'runtime/catch_tracker.dart';
 import 'runtime/harbor_gate.dart';
 import 'runtime/icy_cache.dart';
+import 'runtime/insight.dart';
 import 'runtime/tide_sensor.dart';
 import 'theme/app_colors.dart';
 
@@ -81,13 +83,18 @@ Future<void> main() async {
   final HarborGate harborGate = HarborGate(cache);
   final BeaconHub beaconHub = BeaconHub(cache);
 
+  // ClarityWidget must be the outermost wrapper so replay covers every
+  // native screen. The config is constructed via Insight.config (guarded).
   runApp(
-    ChassisApp(
-      cache: cache,
-      tideSensor: tideSensor,
-      catchTracker: catchTracker,
-      harborGate: harborGate,
-      beaconHub: beaconHub,
+    ClarityWidget(
+      clarityConfig: Insight.config,
+      app: ChassisApp(
+        cache: cache,
+        tideSensor: tideSensor,
+        catchTracker: catchTracker,
+        harborGate: harborGate,
+        beaconHub: beaconHub,
+      ),
     ),
   );
 }

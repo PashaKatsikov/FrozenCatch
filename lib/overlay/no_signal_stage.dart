@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../runtime/insight.dart';
 import '../theme/app_assets.dart';
 import '../theme/app_colors.dart';
 import 'frost_action_button.dart';
@@ -34,7 +35,14 @@ class NoSignalStage extends StatefulWidget {
 class _NoSignalStageState extends State<NoSignalStage> {
   bool _retrying = false;
 
+  @override
+  void initState() {
+    super.initState();
+    Insight.screen('offline');
+  }
+
   Future<void> _handleRetry() async {
+    Insight.event('offline_retry');
     if (_retrying) return;
     setState(() => _retrying = true);
     // A short beat so the user sees the pressed state react — otherwise

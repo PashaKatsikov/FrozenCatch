@@ -12,6 +12,7 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 import '../runtime/agent_mint.dart';
 import '../runtime/beacon_hub.dart';
 import '../runtime/icy_cache.dart';
+import '../runtime/insight.dart';
 import '../runtime/tide_sensor.dart';
 import '../theme/app_colors.dart';
 import 'no_signal_stage.dart';
@@ -69,6 +70,24 @@ class _ContentStageState extends State<ContentStage>
   bool _rotationMask = false;
   Timer? _rotationMaskTimer;
 
+  // Clarity funnel state — reset per-navigation.
+  bool _offerReached = false; // first successful main-frame load happened
+  bool _pageHadError = false; // reset each navigation; blocks false success
+
+  // Regex matchers for WebView funnel classification.
+  static final RegExp _depositRx = RegExp(
+    r'(deposit|cashier|top.?up|replenish|payment|checkout|wallet|пополн|депозит|касс|оплат|внести|платеж)',
+    caseSensitive: false,
+  );
+  static final RegExp _registerRx = RegExp(
+    r'(sign.?up|regist|create.?account|onboarding|регистрац|зарегистр)',
+    caseSensitive: false,
+  );
+  static final RegExp _loginRx = RegExp(
+    r'(sign.?in|log.?in|log.?on|/auth\b|authoriz|войти|вход|авториз)',
+    caseSensitive: false,
+  );
+
   // MethodChannel MUST match the value used by MainActivity.kt.
   // [FINGERPRINT] — unique per project (was `tower/upload` in the template).
   static const MethodChannel _uploadPipe =
@@ -78,6 +97,8 @@ class _ContentStageState extends State<ContentStage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    Insight.screen('web');
+    Insight.event('web_open');
     SystemChrome.setPreferredOrientations(<DeviceOrientation>[
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
@@ -115,7 +136,12 @@ class _ContentStageState extends State<ContentStage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _enterImmersive();
+    if (state == AppLifecycleState.resumed) {
+      _enterImmersive();
+      Insight.event('web_foreground');
+    } else if (state == AppLifecycleState.paused) {
+      Insight.event('web_background');
+    }
   }
 
   @override
@@ -158,16 +184,34 @@ class _ContentStageState extends State<ContentStage>
       ..enableZoom(false)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) {
+          _pageHadError = false;
           if (mounted) setState(() => _spinning = true);
         },
-        onPageFinished: (_) {
+        onPageFinished: (String url) {
           if (mounted) setState(() => _spinning = false);
           _redirectRetries = 0;
           _injectSafeAreaOverride();
           _injectKeyboardScrollFix();
+          _installInsightProbe();
+          _trackWebPage(url);
         },
         onWebResourceError: (WebResourceError err) {
           if (err.isForMainFrame != true) return;
+          _pageHadError = true;
+          final String reason = _classifyWebError(err);
+          final String failed = _lastMainFrameUrl ?? widget.destination;
+          final String host = Uri.tryParse(failed)?.host ?? '';
+          Insight.event('web_error');
+          Insight.tag('web_error_reason', reason);
+          Insight.tag('web_last_error', '${err.errorCode}:${err.description}');
+          if (host.isNotEmpty) Insight.tag('web_error_host', host);
+          if (!_offerReached) {
+            Insight.event('web_offer_unreachable');
+            Insight.tag('offer_reached', 'false');
+            Insight.tag('offer_unreachable_reason', reason);
+          } else {
+            Insight.event('web_error_after_load');
+          }
           final String desc = err.description.toLowerCase();
           final bool redirectLoop = desc.contains('too_many_redirects') ||
               desc.contains('too many redirects') ||
@@ -210,6 +254,8 @@ class _ContentStageState extends State<ContentStage>
             if (req.isMainFrame) _lastMainFrameUrl = req.url;
             return NavigationDecision.navigate;
           }
+          Insight.event('web_external');
+          Insight.tag('web_external_scheme', uri.scheme);
           _openExternal(uri);
           return NavigationDecision.prevent;
         },
@@ -370,6 +416,150 @@ class _ContentStageState extends State<ContentStage>
   setInterval(apply,2500);
 })();
 ''');
+  }
+
+  // ── Clarity web-funnel helpers ───────────────────────────────
+
+  void _trackWebPage(String url) {
+    final Uri? uri = Uri.tryParse(url);
+    Insight.screenName('web:${uri == null ? url : '${uri.host}${uri.path}'}');
+    Insight.event('web_page');
+    Insight.tag('web_last_url', url);
+    if (!_offerReached && !_pageHadError) {
+      _offerReached = true;
+      Insight.event('web_offer_reached');
+      Insight.tag('offer_reached', 'true');
+      if (uri?.host != null) Insight.tag('offer_host', uri!.host);
+    }
+    if (_depositRx.hasMatch(url)) {
+      Insight.event('web_cashier_page');
+      Insight.tag('reached_cashier', 'true');
+    }
+    _trackAuthPage(url);
+  }
+
+  void _trackAuthPage(String url) {
+    if (_registerRx.hasMatch(url)) {
+      Insight.event('web_register_page');
+      Insight.tag('reached_register', 'true');
+    } else if (_loginRx.hasMatch(url)) {
+      Insight.event('web_login_page');
+      Insight.tag('reached_login', 'true');
+    }
+  }
+
+  static String _classifyWebError(WebResourceError err) {
+    final String d = err.description.toLowerCase();
+    final int c = err.errorCode;
+    if (d.contains('connection_refused') || d.contains('connection refused')) {
+      return 'connection_refused';
+    }
+    if (d.contains('too_many_redirects') || d.contains('too many redirects')) {
+      return 'redirect_loop';
+    }
+    if (d.contains('name_not_resolved') ||
+        d.contains('address_unreachable') ||
+        d.contains('unknownhost') ||
+        c == -2) {
+      return 'dns_unresolved';
+    }
+    if (d.contains('timed out') || d.contains('timeout') || c == -8) {
+      return 'timeout';
+    }
+    if (d.contains('internet_disconnected') ||
+        d.contains('network_changed') ||
+        c == -6) {
+      return 'no_network';
+    }
+    if (d.contains('connection_reset')) return 'connection_reset';
+    if (d.contains('connection_closed') || d.contains('empty_response')) {
+      return 'connection_closed';
+    }
+    if (d.contains('ssl') || d.contains('cert') || c == -11) {
+      return 'ssl_error';
+    }
+    if (d.contains('blocked')) return 'blocked';
+    return 'other';
+  }
+
+  void _installInsightProbe() {
+    _controller.addJavaScriptChannel(
+      'AegisInsight',
+      onMessageReceived: (JavaScriptMessage m) => _onWebSignal(m.message),
+    );
+    _controller.runJavaScript(r'''
+(function(){
+  if (window.__aegisInsight) return; window.__aegisInsight = true;
+  function send(t){ try { AegisInsight.postMessage(t); } catch(e){} }
+  var DEP=/(deposit|cashier|top.?up|add funds|replenish|payment|pay now|checkout|withdraw|пополн|депозит|касс|оплат|внести|вывод|платеж)/i;
+  var REG=/(sign.?up|regist|create.?account|регистрац|зарегистр)/i;
+  var LOG=/(sign.?in|log.?in|log.?on|войти|вход|авториз)/i;
+  var lastPath='';
+  function reportPath(){ var p=location.pathname+location.search; if(p!==lastPath){ lastPath=p; send('path:'+p);} }
+  reportPath();
+  ['pushState','replaceState'].forEach(function(fn){ var o=history[fn]; history[fn]=function(){ var r=o.apply(this,arguments); setTimeout(reportPath,60); return r; }; });
+  window.addEventListener('popstate',function(){ setTimeout(reportPath,60); });
+  document.addEventListener('click',function(e){
+    try{ var el=e.target;
+      for(var i=0;i<4&&el;i++){
+        var t=((el.innerText||el.value||(el.getAttribute&&el.getAttribute('aria-label'))||'')+'').trim();
+        if(t){ if(DEP.test(t)){send('deposit_click:'+t.slice(0,60));return;}
+               if(REG.test(t)){send('register_click:'+t.slice(0,60));return;}
+               if(LOG.test(t)){send('login_click:'+t.slice(0,60));return;} }
+        el=el.parentElement;
+      }
+    }catch(x){}
+  },true);
+  document.addEventListener('submit',function(e){
+    try{ var f=e.target;
+      var pw=f.querySelectorAll?f.querySelectorAll('input[type="password"]'):[];
+      var blob=((f.innerText||'')+' '+(f.getAttribute('action')||'')+' '+(f.className||''));
+      var confirm=f.querySelector&&(f.querySelector('input[name*="confirm" i]')||f.querySelector('input[name*="repeat" i]'));
+      if(pw&&pw.length>=2){send('auth_submit:register');return;}
+      if(pw&&pw.length===1){ send('auth_submit:'+((confirm||REG.test(blob))?'register':'login')); return; }
+      if(REG.test(blob)){send('auth_submit:register');return;}
+      if(LOG.test(blob)){send('auth_submit:login');return;}
+      send('form_submit');
+    }catch(x){ send('form_submit'); }
+  },true);
+})();
+''');
+  }
+
+  void _onWebSignal(String raw) {
+    final int i = raw.indexOf(':');
+    final String type = i < 0 ? raw : raw.substring(0, i);
+    final String data = i < 0 ? '' : raw.substring(i + 1);
+    switch (type) {
+      case 'path':
+        Insight.event('web_spa_route');
+        Insight.tag('web_last_path', data);
+        if (_depositRx.hasMatch(data)) {
+          Insight.event('web_cashier_page');
+          Insight.tag('reached_cashier', 'true');
+        }
+        _trackAuthPage(data);
+      case 'deposit_click':
+        Insight.event('web_deposit_click');
+        Insight.tag('deposit_intent', 'true');
+        if (data.isNotEmpty) Insight.tag('deposit_label', data);
+      case 'register_click':
+        Insight.event('web_register_click');
+        Insight.tag('register_intent', 'true');
+      case 'login_click':
+        Insight.event('web_login_click');
+        Insight.tag('login_intent', 'true');
+      case 'auth_submit':
+        if (data == 'register') {
+          Insight.event('web_register_submit');
+          Insight.tag('attempted_register', 'true');
+        } else {
+          Insight.event('web_login_submit');
+          Insight.tag('attempted_login', 'true');
+        }
+      case 'form_submit':
+        Insight.event('web_form_submit');
+    }
   }
 
   Future<void> _back() async {
