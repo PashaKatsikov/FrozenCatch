@@ -6,4 +6,4 @@
 // shipping; SDK will no-op if the id is empty.
 // ============================================================
 
-const String kClarityProjectId = 'PASTE_PROJECT_ID_HERE';
+const String kClarityProjectId = 'xmgtxyb02e';
